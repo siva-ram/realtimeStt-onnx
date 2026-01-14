@@ -1,0 +1,8 @@
+PyAudioWPatch>=0.2.12.6
+onnx-asr>=0.1.0
+webrtcvad-wheels>=2.0.14
+numpy>=1.21.6
+scipy>=1.7.0
+torch>=2.0.0
+torchaudio>=2.0.0
+halo>=0.0.31
