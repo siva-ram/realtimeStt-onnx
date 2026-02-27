@@ -159,6 +159,11 @@ class AudioToTextRecorder:
         self.speech_detected = False
         self.silence_start = None
         
+        # Resampling state
+        self._needs_resampling = False
+        self._device_sample_rate = sample_rate
+        self._device_channels = 1
+        
         # Threading
         self.audio_queue = Queue()
         self.processing_thread = None
@@ -202,20 +207,81 @@ class AudioToTextRecorder:
                         logger.error(f"Failed to get WASAPI loopback device: {e}")
                         raise
             
-            # Open audio stream
+            # DEBUG: Print all available devices
+            logger.info("=== Available Audio Devices ===")
+            for i in range(self.audio.get_device_count()):
+                try:
+                    info = self.audio.get_device_info_by_index(i)
+                    logger.info(f"Device {i}: {info['name']}")
+                    logger.info(f"  Max Input Channels: {info['maxInputChannels']}")
+                    logger.info(f"  Max Output Channels: {info['maxOutputChannels']}")
+                    logger.info(f"  Default Sample Rate: {info['defaultSampleRate']}")
+                    logger.info(f"  Host API: {self.audio.get_host_api_info_by_index(info['hostApi'])['name']}")
+                except Exception as e:
+                    logger.warning(f"Device {i}: Error getting info - {e}")
+            logger.info(f"=== Attempting to use device_index={device_index} ===")
+            
+            # Get device info to check supported sample rate
+            logger.info(f"Getting device info for device_index={device_index}")
+            device_info = None
+            if device_index is not None:
+                try:
+                    device_info = self.audio.get_device_info_by_index(device_index)
+                    logger.info(f"Got device info: {device_info['name']}")
+                except Exception as e:
+                    logger.error(f"Failed to get device info for index {device_index}: {e}")
+                    raise
+            else:
+                device_info = self.audio.get_default_input_device_info()
+                device_index = device_info['index']  # Store the default device index
+                logger.info(f"Using default device {device_index}: {device_info['name']}")
+            
+            # Get device's native parameters
+            device_sample_rate = int(device_info['defaultSampleRate'])
+            device_channels = int(device_info['maxInputChannels'])
+            
+            logger.info(f"Device capabilities: {device_channels} channels, {device_sample_rate} Hz")
+            
+            # Determine actual parameters to use
+            actual_sample_rate = self.sample_rate
+            actual_channels = 1  # We'll convert stereo to mono if needed
+            
+            # For now, always use device's native sample rate and resample if needed
+            # This avoids compatibility issues with some devices
+            if device_sample_rate != self.sample_rate:
+                logger.warning(f"Device uses {device_sample_rate} Hz, requested {self.sample_rate} Hz")
+                logger.info(f"Will use device rate {device_sample_rate} Hz and resample to {self.sample_rate} Hz")
+                actual_sample_rate = device_sample_rate
+                self._needs_resampling = True
+                self._device_sample_rate = device_sample_rate
+            else:
+                self._needs_resampling = False
+            
+            # Use device's native channel count
+            actual_channels = device_channels
+            
+            # Calculate appropriate chunk size for the actual sample rate
+            actual_chunk_size = int(self.chunk_size * actual_sample_rate / self.sample_rate)
+            
+            logger.info(f"Opening stream: device={device_index}, rate={actual_sample_rate}Hz, channels={actual_channels}, chunks={actual_chunk_size}")
+            
+            # Open audio stream with device's native parameters
             self.stream = self.audio.open(
                 format=pyaudio.paInt16,
-                channels=1,
-                rate=self.sample_rate,
+                channels=actual_channels,
+                rate=actual_sample_rate,
                 input=True,
                 input_device_index=device_index,
-                frames_per_buffer=self.chunk_size,
+                frames_per_buffer=actual_chunk_size,
                 stream_callback=self._audio_callback
             )
             
+            # Store channel count for callback processing
+            self._device_channels = actual_channels
+            
             self.stream.start_stream()
             source_type = "speaker" if self.input_device_type == "speaker" else "microphone"
-            logger.info(f"{source_type.capitalize()} stream started")
+            logger.info(f"{source_type.capitalize()} stream started at {actual_sample_rate} Hz")
         
         # Start processing thread
         self.processing_thread = threading.Thread(target=self._process_audio)
@@ -336,17 +402,39 @@ class AudioToTextRecorder:
         # Convert bytes to numpy array
         audio_chunk = np.frombuffer(in_data, dtype=np.int16)
         
+        # Convert stereo to mono if needed
+        if self._device_channels > 1:
+            # Reshape to (samples, channels) and take mean across channels
+            audio_chunk = audio_chunk.reshape(-1, self._device_channels)
+            audio_chunk = audio_chunk.mean(axis=1).astype(np.int16)
+        
+        # Resample if device sample rate differs from target sample rate
+        if self._needs_resampling and self._device_sample_rate != self.sample_rate:
+            # Simple resampling using scipy
+            from scipy import signal
+            num_samples = int(len(audio_chunk) * self.sample_rate / self._device_sample_rate)
+            audio_chunk = signal.resample(audio_chunk, num_samples).astype(np.int16)
+        
+        # Update in_data for WebRTC VAD (convert back to bytes)
+        in_data = audio_chunk.tobytes()
+        
         # Add to queue for processing
         self.audio_queue.put((in_data, audio_chunk))
         
         return (in_data, pyaudio.paContinue)
     
     def _process_audio(self) -> None:
-        """Process audio chunks from queue."""
-        while not self.stop_event.is_set():
+        """Process audio from the queue."""
+        from queue import Empty
+        
+        while self.is_running:
             try:
-                # Get audio chunk from queue (with timeout)
-                audio_data = self.audio_queue.get(timeout=0.1)
+                # Get audio from queue with timeout
+                try:
+                    audio_data = self.audio_queue.get(timeout=0.1)
+                except Empty:
+                    # Queue timeout is normal, just continue
+                    continue
                 
                 if audio_data is None:
                     continue
@@ -404,7 +492,7 @@ class AudioToTextRecorder:
                 
             except Exception as e:
                 if not self.stop_event.is_set():
-                    logger.error(f"Error processing audio: {e}")
+                    logger.error(f"Error processing audio: {e}", exc_info=True)
     
     def __enter__(self):
         """Context manager entry."""
